@@ -1,6 +1,6 @@
 python tools/train_gan.py \
     --job anycost-multires_ffhq-1024_distill \
-    --data_path /dataset/ffhq/images-wrap --resume \
+    --data_path /isilon/Datasets/ffhq-for-training/ffhq-unpacked --resume \
     --channel_multiplier 2 --resolution 1024 \
     --lr 0.002 --epochs 20 --batch_size 4 -j 2 \
     --fid_n_sample 50000 --fid_batch_size 8 \

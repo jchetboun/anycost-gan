@@ -1,0 +1,6 @@
+pillow
+ipywidgets
+lpips
+torchprofile
+pyqt5
+horovod
