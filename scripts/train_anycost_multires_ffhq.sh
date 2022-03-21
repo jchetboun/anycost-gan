@@ -8,4 +8,5 @@ python tools/train_gan.py \
     --n_res 4 --n_sampled_res 2 \
     --g_reg_every -1 \
     --tune_from checkpoint/stylegan2-ffhq-config-f.pt \
-    --teacher_ckpt checkpoint/stylegan2-ffhq-config-f.pt
+    --teacher_ckpt checkpoint/stylegan2-ffhq-config-f.pt \
+    --use_horovod

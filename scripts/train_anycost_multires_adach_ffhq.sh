@@ -9,4 +9,6 @@ python tools/train_gan.py \
     --dynamic_channel --sort_pretrain --conditioned_d \
     --g_reg_every -1 \
     --tune_from checkpoint/anycost-multires_ffhq-1024_distill/ckpt-best.pt \
-    --teacher_ckpt checkpoint/anycost-multires_ffhq-1024_distill/ckpt-best.pt
+    --teacher_ckpt checkpoint/anycost-multires_ffhq-1024_distill/ckpt-best.pt \
+    --use_horovod
+

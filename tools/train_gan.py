@@ -350,25 +350,33 @@ if __name__ == "__main__":
     parser.add_argument('--conditioned_d', action='store_true', default=False, help='D is conditioned on G')
     parser.add_argument('--min_channel', type=int, default=8)
     parser.add_argument('--divided_by', type=int, default=4)
+    # use horovod
+    parser.add_argument('--use_horovod', action='store_true', default=False)
 
     args = parser.parse_args()
 
-    hvd.init()
-    torch.cuda.set_device(hvd.local_rank())
+    if args.use_horovod:
+        hvd.init()
+        torch.cuda.set_device(hvd.local_rank())
+        hvd_size = hvd.size()
+        hvd_rank = hvd.rank()
+    else:
+        hvd_size = 1
+        hvd_rank = 0
     # save memory when using dynamic channel
     # cudnn benchmark will lead to bug when computing G regularization, resulting in extremely slow computing
     cudnn.benchmark = (not args.dynamic_channel) and args.g_reg_every <= 0
 
     assert args.job is not None
-    if hvd.rank() == 0:
+    if hvd_rank == 0:
         print(' * JOB:', args.job)
     # make log dirs
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(os.path.join(checkpoint_dir, args.job), exist_ok=True)
-    log_writer = SummaryWriter(os.path.join(log_dir, args.job)) if hvd.rank() == 0 else None
+    log_writer = SummaryWriter(os.path.join(log_dir, args.job)) if hvd_rank == 0 else None
 
-    if hvd.rank() == 0:  # save args
+    if hvd_rank == 0:  # save args
         with open(os.path.join(log_dir, args.job, 'args.txt'), 'w') as f:
             json.dump(args.__dict__, f, indent=4)
 
@@ -391,7 +399,7 @@ if __name__ == "__main__":
         ])
     dataset = NativeDataset(args.data_path, transform=transform)
     sampler = torch.utils.data.distributed.DistributedSampler(
-        dataset, num_replicas=hvd.size(), rank=hvd.rank())
+        dataset, num_replicas=hvd_size, rank=hvd_rank)
     data_loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
                                               num_workers=args.workers, pin_memory=True, drop_last=True)
 
@@ -416,7 +424,7 @@ if __name__ == "__main__":
                       channel_multiplier=args.channel_multiplier).to(device)
     g_ema.eval()
 
-    if hvd.rank() == 0:  # measure flops and #param
+    if hvd_rank == 0:  # measure flops and #param
         print(' * D Params: {:.2f}M'.format(sum([p.numel() for p in discriminator.parameters()]) / 1e6))
         print(' * G Params: {:.2f}M'.format(sum([p.numel() for p in generator.parameters()]) / 1e6))
         try:
@@ -430,7 +438,7 @@ if __name__ == "__main__":
 
     # tune from a previous checkpoint
     if args.tune_from:
-        if hvd.rank() == 0:
+        if hvd_rank == 0:
             print(' * Tuning from {}'.format(args.tune_from))
         # 1. load G
         sd = torch.load(args.tune_from, map_location='cpu')
@@ -438,7 +446,7 @@ if __name__ == "__main__":
         generator.load_state_dict(sd['g_ema'])
 
         if args.sort_pretrain:
-            if hvd.rank() == 0:
+            if hvd_rank == 0:
                 print(' * Sorting the channels of the generator...')
             sort_channel(generator)
 
@@ -458,7 +466,7 @@ if __name__ == "__main__":
 
     # build teacher (if distill.)
     if args.teacher_ckpt is not None:
-        if hvd.rank() == 0:
+        if hvd_rank == 0:
             print(' * Building teacher models...')
         teacher = Generator(args.resolution, args.latent_dim, args.n_mlp,
                             channel_multiplier=args.t_channel_multiplier).to(device)
@@ -478,19 +486,20 @@ if __name__ == "__main__":
     g_optim = optim.Adam(generator.parameters(), lr=args.lr, betas=(0., 0.99))
     d_optim = optim.Adam(discriminator.parameters(), lr=args.lr, betas=(0., 0.99))
 
-    g_optim = hvd.DistributedOptimizer(
-        g_optim, named_parameters=generator.named_parameters(prefix='generator'),
-    )
-    d_optim = hvd.DistributedOptimizer(
-        d_optim, named_parameters=discriminator.named_parameters(prefix='discriminator'),
-    )
+    if args.use_horovod:
+        g_optim = hvd.DistributedOptimizer(
+            g_optim, named_parameters=generator.named_parameters(prefix='generator'),
+        )
+        d_optim = hvd.DistributedOptimizer(
+            d_optim, named_parameters=discriminator.named_parameters(prefix='discriminator'),
+        )
 
     resume_from_epoch = 0
     mean_path_length = 0.  # track mean path len globally
     if args.resume:
         ckpt_path = os.path.join(checkpoint_dir, args.job, 'ckpt.pt')
         if os.path.exists(ckpt_path):
-            if hvd.rank() == 0:
+            if hvd_rank == 0:
                 print(" * Resuming from:", ckpt_path)
                 sd = torch.load(ckpt_path, map_location='cpu')
                 resume_from_epoch = sd['epoch']
@@ -503,15 +512,16 @@ if __name__ == "__main__":
                 best_fid = sd['best_fid']
                 mean_path_length = sd['mean_path_length']
 
-    resume_from_epoch = hvd.broadcast(torch.tensor(resume_from_epoch), root_rank=0,
-                                      name='resume_from_epoch').item()
+    if args.use_horovod:
+        resume_from_epoch = hvd.broadcast(torch.tensor(resume_from_epoch), root_rank=0,
+                                          name='resume_from_epoch').item()
 
-    # Horovod: broadcast parameters & optimizer state.
-    hvd.broadcast_parameters(generator.state_dict(), root_rank=0)
-    hvd.broadcast_parameters(discriminator.state_dict(), root_rank=0)
-    hvd.broadcast_parameters(g_ema.state_dict(), root_rank=0)
-    hvd.broadcast_optimizer_state(g_optim, root_rank=0)
-    hvd.broadcast_optimizer_state(d_optim, root_rank=0)
+        # Horovod: broadcast parameters & optimizer state.
+        hvd.broadcast_parameters(generator.state_dict(), root_rank=0)
+        hvd.broadcast_parameters(discriminator.state_dict(), root_rank=0)
+        hvd.broadcast_parameters(g_ema.state_dict(), root_rank=0)
+        hvd.broadcast_optimizer_state(g_optim, root_rank=0)
+        hvd.broadcast_optimizer_state(d_optim, root_rank=0)
 
     # draw a sample z for visualization
     torch.manual_seed(2020)
