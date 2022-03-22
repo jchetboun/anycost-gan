@@ -62,10 +62,19 @@ class DistributedMeter(object):
         else:
             self.sum = torch.zeros(dim)
         self.n = torch.tensor(0.)
+        try:
+            import horovod.torch as hvd
+            _ = hvd.size()
+            self.use_horovod = True
+        except:
+            self.use_horovod = False
 
     def update(self, val):
-        import horovod.torch as hvd
-        self.sum += hvd.allreduce(val.detach().cpu(), name=self.name)
+        if self.use_horovod:
+            import horovod.torch as hvd
+            self.sum += hvd.allreduce(val.detach().cpu(), name=self.name)
+        else:
+            self.sum += val.detach().cpu()
         self.n += 1
 
     @property

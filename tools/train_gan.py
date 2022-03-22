@@ -38,7 +38,7 @@ checkpoint_dir = 'checkpoint'
 best_fid = 1e9
 
 
-def train(epoch):
+def train(epoch, use_horovod=True):
     generator.train()
     discriminator.train()
     g_ema.eval()
@@ -46,10 +46,10 @@ def train(epoch):
 
     with tqdm(total=len(data_loader),
               desc='Epoch #{}'.format(epoch + 1),
-              disable=hvd.rank() != 0, dynamic_ncols=True) as t:
+              disable=hvd_rank != 0, dynamic_ncols=True) as t:
         global mean_path_length  # track across epochs
 
-        ema_decay = 0.5 ** (args.batch_size * hvd.size() / (args.half_life_kimg * 1000.))
+        ema_decay = 0.5 ** (args.batch_size * hvd_size / (args.half_life_kimg * 1000.))
 
         # loss meters
         d_loss_meter = DistributedMeter('d_loss')
@@ -184,7 +184,8 @@ def train(epoch):
                 weighted_path_loss += 0 * fake_img[0, 0, 0, 0]
                 weighted_path_loss.backward()
                 g_optim.step()
-                mean_path_length = hvd.allreduce(torch.Tensor([mean_path_length])).item()  # update across gpus
+                if use_horovod:
+                    mean_path_length = hvd.allreduce(torch.Tensor([mean_path_length])).item()  # update across gpus
                 path_loss_meter.update(path_loss)
 
             # moving update
@@ -206,8 +207,8 @@ def train(epoch):
             t.set_postfix(info2display)
             t.update(1)
 
-            if hvd.rank() == 0 and global_idx % args.log_every == 0:
-                n_trained_images = global_idx * args.batch_size * hvd.size()
+            if hvd_rank == 0 and global_idx % args.log_every == 0:
+                n_trained_images = global_idx * args.batch_size * hvd_size
                 log_writer.add_scalar('Loss/D', d_loss_meter.avg.item(), n_trained_images)
                 log_writer.add_scalar('Loss/G', g_loss_meter.avg.item(), n_trained_images)
                 log_writer.add_scalar('Loss/r1', r1_loss_meter.avg.item(), n_trained_images)
@@ -215,33 +216,33 @@ def train(epoch):
                 log_writer.add_scalar('Loss/path-len', mean_path_length, n_trained_images)
                 log_writer.add_scalar('Loss/distill', distill_loss_meter.avg.item(), n_trained_images)
 
-            if hvd.rank() == 0 and global_idx % args.log_vis_every == 0:  # log image
+            if hvd_rank == 0 and global_idx % args.log_vis_every == 0:  # log image
                 with torch.no_grad():
                     g_ema.eval()
                     mean_style = g_ema.mean_style(10000)
                     sample, _ = g_ema(sample_z, truncation=args.vis_truncation, truncation_style=mean_style)
-                    n_trained_images = global_idx * args.batch_size * hvd.size()
+                    n_trained_images = global_idx * args.batch_size * hvd_size
                     grid = utils.make_grid(sample, nrow=int(args.n_vis_sample ** 0.5), normalize=True,
                                            range=(-1, 1))
                     log_writer.add_image('images', grid, n_trained_images)
 
 
-def validate(epoch):
+def validate(epoch, use_horovod=True):
     if args.dynamic_channel:  # we also evaluate the model with half channels
         set_uniform_channel_ratio(g_ema, 0.5)
-        fid = measure_fid()
+        fid = measure_fid(use_horovod)
         reset_generator(g_ema)
-        if hvd.rank() == 0:
+        if hvd_rank == 0:
             print(' * FID-0.5x: {:.2f}'.format(fid))
             log_writer.add_scalar('Metrics/fid-0.5x', fid,
-                                  len(data_loader) * (epoch + 1) * args.batch_size * hvd.size())
+                                  len(data_loader) * (epoch + 1) * args.batch_size * hvd_size)
 
-    fid = measure_fid()
-    if hvd.rank() == 0:
-        log_writer.add_scalar('Metrics/fid', fid, len(data_loader) * (epoch + 1) * args.batch_size * hvd.size())
+    fid = measure_fid(use_horovod)
+    if hvd_rank == 0:
+        log_writer.add_scalar('Metrics/fid', fid, len(data_loader) * (epoch + 1) * args.batch_size * hvd_size)
     global best_fid
     best_fid = min(best_fid, fid)
-    if hvd.rank() == 0:
+    if hvd_rank == 0:
         print(' * FID: {:.2f} ({:.2f})'.format(fid, best_fid))
         state_dict = {
             "g": generator.state_dict(),
@@ -259,19 +260,19 @@ def validate(epoch):
             torch.save(state_dict, os.path.join(checkpoint_dir, args.job, 'ckpt-best.pt'))
 
 
-def measure_fid():
+def measure_fid(use_horovod=True):
     # get all the resolutions to evaluate fid
     # WARNING: always assume that we measure the largest few resolutions
     n_res_to_eval = len(args.inception_path.split(','))  # support evaluating multiple resolutions
     inception_path_list = args.inception_path.split(',')
 
-    n_batch = math.ceil(args.fid_n_sample / (args.fid_batch_size * hvd.size()))
+    n_batch = math.ceil(args.fid_n_sample / (args.fid_batch_size * hvd_size))
 
     features_list = [None for _ in range(n_res_to_eval)]
-    torch.manual_seed(int(time.time()) + hvd.rank() * 999)  # just make sure they use different seed
+    torch.manual_seed(int(time.time()) + hvd_rank * 999)  # just make sure they use different seed
     # collect features
     with torch.no_grad():
-        for _ in tqdm(range(n_batch), desc='FID', disable=hvd.rank() != 0):
+        for _ in tqdm(range(n_batch), desc='FID', disable=hvd_rank != 0):
             z = torch.randn(args.fid_batch_size, 1, 512, device=device)
             out, all_rgbs = g_ema(z, return_rgbs=True)
             for i_res in range(n_res_to_eval):
@@ -284,7 +285,8 @@ def measure_fid():
     # compute the FID
     fid_dict = dict()
     for i_res, features in enumerate(features_list):
-        features = hvd.allgather(features, name='fid_features{}'.format(i_res)).numpy()
+        if use_horovod:
+            features = hvd.allgather(features, name='fid_features{}'.format(i_res)).numpy()
         features = features[:args.fid_n_sample]
         if hvd.rank() == 0:  # only compute on node 1, save some CPU
             sample_mean = np.mean(features, 0)
@@ -299,7 +301,10 @@ def measure_fid():
             fid_dict[int(args.resolution / 2 ** i_res)] = 1e9
     if hvd.rank() == 0:
         print('fid:', {k: round(v, 3) for k, v in fid_dict.items()})
-    fid0 = hvd.broadcast(torch.tensor(fid_dict[args.resolution]).float(), root_rank=0, name='fid').item()
+    if use_horovod:
+        fid0 = hvd.broadcast(torch.tensor(fid_dict[args.resolution]).float(), root_rank=0, name='fid').item()
+    else:
+        fid0 = torch.tensor(fid_dict[args.resolution]).float()
     return fid0  # only return the fid of the largest resolution
 
 
@@ -528,5 +533,5 @@ if __name__ == "__main__":
     sample_z = torch.randn(args.n_vis_sample, 1, args.latent_dim).float().to(device)
 
     for i_epoch in range(resume_from_epoch, args.epochs):
-        train(i_epoch)
-        validate(i_epoch)
+        train(i_epoch, use_horovod=args.use_horovod)
+        validate(i_epoch, use_horovod=args.use_horovod)
