@@ -288,7 +288,7 @@ def measure_fid(use_horovod=True):
         if use_horovod:
             features = hvd.allgather(features, name='fid_features{}'.format(i_res)).numpy()
         features = features[:args.fid_n_sample]
-        if hvd.rank() == 0:  # only compute on node 1, save some CPU
+        if hvd_rank == 0:  # only compute on node 1, save some CPU
             sample_mean = np.mean(features, 0)
             sample_cov = np.cov(features, rowvar=False)
             with open(inception_path_list[i_res], 'rb') as f:
@@ -299,7 +299,7 @@ def measure_fid(use_horovod=True):
             fid_dict[int(args.resolution / 2 ** i_res)] = fid
         else:
             fid_dict[int(args.resolution / 2 ** i_res)] = 1e9
-    if hvd.rank() == 0:
+    if hvd_rank == 0:
         print('fid:', {k: round(v, 3) for k, v in fid_dict.items()})
     if use_horovod:
         fid0 = hvd.broadcast(torch.tensor(fid_dict[args.resolution]).float(), root_rank=0, name='fid').item()
@@ -436,7 +436,7 @@ if __name__ == "__main__":
             from torchprofile import profile_macs
 
             generator.eval()
-            macs = profile_macs(generator, [torch.rand(1, 512).to(device)])
+            macs = profile_macs(generator, torch.rand(1, 1, 512).to(device))
             print(' * G MACs: {:.2f}G'.format(macs / 1e9))
         except:
             print(' * Profiling failed. Pass.')
